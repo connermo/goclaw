@@ -20,6 +20,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/consolidation"
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	kg "github.com/nextlevelbuilder/goclaw/internal/knowledgegraph"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/dingtalk"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/facebook"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/pancake"
@@ -33,11 +34,13 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
+	"github.com/nextlevelbuilder/goclaw/internal/heartbeat"
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	mcpbridge "github.com/nextlevelbuilder/goclaw/internal/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/runtime"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -96,6 +99,9 @@ func runGateway() {
 			slog.Warn("unknown GOCLAW_EDITION, using standard", "value", edName)
 		}
 	}
+
+	role := runtime.Current()
+	slog.Info("runtime role", "role", string(role))
 
 	// Create core components
 	msgBus := bus.New()
@@ -198,8 +204,11 @@ func runGateway() {
 	// Fallback: background.provider → agent.default_provider → first registered provider.
 	bgProvider, bgModel := resolveBackgroundProvider(cfg, providerRegistry)
 
-	// V3: Wire consolidation pipeline (episodic → semantic → KG → dreaming)
-	if pgStores.Episodic != nil {
+	// V3: Wire consolidation pipeline (episodic → semantic → KG → dreaming).
+	// Worker-only: runs background event subscribers. With multi-pod (api+worker)
+	// the EventBus is in-process, so events emitted by api pods will not reach
+	// these subscribers. That gap is acceptable for MVP — see plan §12.
+	if runtime.IsWorker() && pgStores.Episodic != nil {
 		if bgProvider != nil {
 			var kgExtractor *kg.Extractor
 			if pgStores.KnowledgeGraph != nil {
@@ -226,9 +235,10 @@ func runGateway() {
 
 	// V3: Wire vault enrichment worker (async summary + embedding + auto-linking).
 	// Provider is resolved per-tenant at runtime — no static provider needed.
+	// Worker-only: background goroutine consumer.
 	var enrichProgress *vault.EnrichProgress
 	var enrichWorker *vault.EnrichWorker
-	if pgStores.Vault != nil && providerRegistry != nil {
+	if runtime.IsWorker() && pgStores.Vault != nil && providerRegistry != nil {
 		cleanupVaultEnrich, ep, ew := vault.RegisterEnrichWorker(vault.EnrichWorkerDeps{
 			VaultStore:    pgStores.Vault,
 			SystemConfigs: pgStores.SystemConfigs,
@@ -452,12 +462,15 @@ func runGateway() {
 	}
 
 	// Load channel instances from DB.
+	// Worker-only: channel pollers/clients are long-running goroutines that
+	// would duplicate consumption if started on multiple pods.
 	var instanceLoader *channels.InstanceLoader
-	if pgStores.ChannelInstances != nil {
+	if runtime.IsWorker() && pgStores.ChannelInstances != nil {
 		instanceLoader = channels.NewInstanceLoader(pgStores.ChannelInstances, pgStores.Agents, channelMgr, msgBus, pgStores.Pairing)
 		instanceLoader.SetProviderRegistry(providerRegistry)
 		instanceLoader.SetPendingCompactionConfig(cfg.Channels.PendingCompaction)
 		instanceLoader.RegisterFactory(channels.TypeTelegram, telegram.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.Teams, pgStores.SubagentTasks, pgStores.PendingMessages, audioMgr))
+		instanceLoader.RegisterFactory(channels.TypeDingTalk, dingtalk.Factory)
 		instanceLoader.RegisterFactory(channels.TypeDiscord, discord.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.PendingMessages, audioMgr))
 		instanceLoader.RegisterFactory(channels.TypeFeishu, feishu.FactoryWithPendingStoreAndAudio(pgStores.PendingMessages, audioMgr))
 		instanceLoader.RegisterFactory(channels.TypeZaloOA, zalo.Factory)
@@ -472,7 +485,9 @@ func runGateway() {
 	}
 
 	// Register config-based channels as fallback when no DB instances loaded.
-	registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader, audioMgr)
+	if runtime.IsWorker() {
+		registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader, audioMgr)
+	}
 
 	// Register channels/instances/links/teams RPC methods
 	wireChannelRPCMethods(server, pgStores, channelMgr, agentRouter, msgBus, workspace)
@@ -504,13 +519,15 @@ func runGateway() {
 		}
 	}
 
-	// Start channels
-	if err := channelMgr.StartAll(ctx); err != nil {
-		slog.Error("failed to start channels", "error", err)
+	// Start channels (worker-only).
+	if runtime.IsWorker() {
+		if err := channelMgr.StartAll(ctx); err != nil {
+			slog.Error("failed to start channels", "error", err)
+		}
 	}
 
 	// Create lane-based scheduler (matching TS CommandLane pattern).
-	// Must be created before cron setup so cron jobs route through the scheduler.
+	// The scheduler is needed on api too — chat completions dispatch through it.
 	sched := scheduler.NewScheduler(
 		scheduler.DefaultLanes(),
 		scheduler.DefaultQueueConfig(),
@@ -519,7 +536,12 @@ func runGateway() {
 	defer sched.Stop()
 
 	// Start cron + heartbeat ticker, wire wake functions and adaptive throttle.
-	heartbeatTicker := startCronAndHeartbeat(pgStores, server, sched, msgBus, providerRegistry, channelMgr, cfg, heartbeatTool, heartbeatMethods)
+	// Worker-only: cron loop polls cron_jobs table; running on N pods would
+	// duplicate firings. Heartbeat ticker is also worker-only.
+	var heartbeatTicker *heartbeat.Ticker
+	if runtime.IsWorker() {
+		heartbeatTicker = startCronAndHeartbeat(pgStores, server, sched, msgBus, providerRegistry, channelMgr, cfg, heartbeatTool, heartbeatMethods)
+	}
 
 	// Subscribe to agent events for channel streaming/reaction forwarding.
 	deps.wireChannelStreamingSubscriber()
