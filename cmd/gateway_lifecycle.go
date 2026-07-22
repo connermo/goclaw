@@ -159,8 +159,10 @@ func (d *gatewayDeps) runLifecycle(
 	// Webhook callback worker — delivers async webhook_calls rows to receiver callback_url.
 	// Runs in both editions: Standard (PG, concurrency=4) and Lite (SQLite, concurrency=1).
 	// sqliteonly: single callback worker — SQLite lacks SKIP LOCKED; BEGIN IMMEDIATE serializes.
+	// Worker-only: it claims webhook_calls rows, so api pods must not compete for them.
 	var webhookWorkerCancel context.CancelFunc
-	if d.pgStores != nil &&
+	if runtime.IsWorker() &&
+		d.pgStores != nil &&
 		d.pgStores.WebhookCalls != nil &&
 		d.pgStores.Webhooks != nil &&
 		d.pgStores.Tenants != nil &&
