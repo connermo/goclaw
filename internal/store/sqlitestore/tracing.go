@@ -389,27 +389,68 @@ func (s *SQLiteTracingStore) DeleteTracesOlderThan(ctx context.Context, cutoff t
 	return res.RowsAffected()
 }
 
-// RecoverStaleRunningTraces marks traces stuck in "running" since before cutoff as "error".
-// Also recovers their stuck spans. Called on startup to fix orphans from crashes.
-func (s *SQLiteTracingStore) RecoverStaleRunningTraces(ctx context.Context, cutoff time.Time) (int64, error) {
-	// Recover stuck spans first.
+// TouchTracesActivity stamps last_activity_at on the given traces.
+func (s *SQLiteTracingStore) TouchTracesActivity(ctx context.Context, traceIDs []uuid.UUID, at time.Time) error {
+	if len(traceIDs) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(traceIDs))
+	args := make([]any, 0, len(traceIDs)+1)
+	args = append(args, at)
+	for i, id := range traceIDs {
+		placeholders[i] = "?"
+		args = append(args, id.String())
+	}
 	_, err := s.db.ExecContext(ctx,
+		`UPDATE traces SET last_activity_at = ?
+		 WHERE status = 'running' AND id IN (`+strings.Join(placeholders, ",")+`)`, args...)
+	if err != nil {
+		return fmt.Errorf("touch traces activity: %w", err)
+	}
+	return nil
+}
+
+// RecoverStaleRunningTraces marks traces whose owning process stopped
+// heartbeating before cutoff as "error", along with their open spans.
+// See the PG implementation for why the gate is last_activity_at and why spans
+// are scoped to the recovered traces. SQLite has no data-modifying CTEs, so the
+// two updates run in one transaction instead.
+func (s *SQLiteTracingStore) RecoverStaleRunningTraces(ctx context.Context, cutoff time.Time) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("recover stale running traces: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Spans first: once the traces flip out of 'running' they can no longer be
+	// selected by the subquery below.
+	_, err = tx.ExecContext(ctx,
 		`UPDATE spans SET status = 'error', error = 'recovered: server restart',
 		   end_time = datetime('now'), duration_ms = CAST((julianday('now') - julianday(start_time)) * 86400000 AS INTEGER)
-		 WHERE status = 'running' AND start_time < ?`, cutoff)
+		 WHERE status = 'running' AND trace_id IN (
+		   SELECT id FROM traces
+		    WHERE status = 'running' AND COALESCE(last_activity_at, start_time) < ?
+		 )`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("recover stale spans: %w", err)
 	}
 
-	res, err := s.db.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`UPDATE traces SET status = 'error',
-		   error = 'recovered: stuck in running state (server restart)',
+		   error = 'recovered: owning process stopped heartbeating (crash or restart)',
 		   end_time = datetime('now'), duration_ms = CAST((julianday('now') - julianday(start_time)) * 86400000 AS INTEGER)
-		 WHERE status = 'running' AND start_time < ?`, cutoff)
+		 WHERE status = 'running' AND COALESCE(last_activity_at, start_time) < ?`, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("recover stale running traces: %w", err)
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("recover stale running traces: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("recover stale running traces: %w", err)
+	}
+	return n, nil
 }
 
 // ListCodexPoolSpans is not supported in SQLite (Codex pool is a standard-edition feature).

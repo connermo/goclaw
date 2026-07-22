@@ -36,6 +36,10 @@ func (m *mockTracingStore) RecoverStaleRunningTraces(_ context.Context, _ time.T
 	return 0, nil
 }
 
+func (m *mockTracingStore) TouchTracesActivity(_ context.Context, _ []uuid.UUID, _ time.Time) error {
+	return nil
+}
+
 // alwaysFailStore always returns an error for UpdateTrace.
 type alwaysFailStore struct {
 	store.TracingStore
@@ -49,6 +53,10 @@ func (s *alwaysFailStore) UpdateTrace(_ context.Context, _ uuid.UUID, _ map[stri
 
 func (s *alwaysFailStore) RecoverStaleRunningTraces(_ context.Context, _ time.Time) (int64, error) {
 	return 0, nil
+}
+
+func (s *alwaysFailStore) TouchTracesActivity(_ context.Context, _ []uuid.UUID, _ time.Time) error {
+	return nil
 }
 
 // newTestCollector creates a Collector with a fake store and no background goroutines.

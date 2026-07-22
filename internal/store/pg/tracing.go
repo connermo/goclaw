@@ -546,25 +546,49 @@ func (s *PGTracingStore) DeleteTracesOlderThan(ctx context.Context, cutoff time.
 	return res.RowsAffected()
 }
 
-// RecoverStaleRunningTraces marks traces stuck in "running" since before cutoff as "error".
-// Also recovers their stuck spans. Called on startup to fix orphans from crashes.
-func (s *PGTracingStore) RecoverStaleRunningTraces(ctx context.Context, cutoff time.Time) (int64, error) {
-	// Recover stuck spans first.
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE spans SET status = 'error', error = 'recovered: server restart',
-		   end_time = NOW(), duration_ms = EXTRACT(EPOCH FROM (NOW() - start_time))::int * 1000
-		 WHERE status = 'running' AND start_time < $1`, cutoff)
-	if err != nil {
-		return 0, fmt.Errorf("recover stale spans: %w", err)
+// TouchTracesActivity stamps last_activity_at on the given traces.
+func (s *PGTracingStore) TouchTracesActivity(ctx context.Context, traceIDs []uuid.UUID, at time.Time) error {
+	if len(traceIDs) == 0 {
+		return nil
 	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE traces SET last_activity_at = $1
+		 WHERE id = ANY($2) AND status = 'running'`, at, pq.Array(traceIDs))
+	if err != nil {
+		return fmt.Errorf("touch traces activity: %w", err)
+	}
+	return nil
+}
 
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE traces SET status = 'error',
-		   error = 'recovered: stuck in running state (server restart)',
-		   end_time = NOW(), duration_ms = EXTRACT(EPOCH FROM (NOW() - start_time))::int * 1000
-		 WHERE status = 'running' AND start_time < $1`, cutoff)
+// RecoverStaleRunningTraces marks traces whose owning process stopped
+// heartbeating before cutoff as "error", along with their open spans.
+//
+// The gate is last_activity_at, not start_time: a run that legitimately takes
+// hours keeps heartbeating and is left alone, while an orphan's heartbeat
+// froze when its process died. Traces with no heartbeat yet (rows predating
+// the column, or created in the window before their first flush) fall back to
+// start_time.
+//
+// Spans are recovered only for the traces being recovered — sweeping every
+// running span by start_time would close spans belonging to healthy runs.
+func (s *PGTracingStore) RecoverStaleRunningTraces(ctx context.Context, cutoff time.Time) (int64, error) {
+	var recovered int64
+	err := s.db.QueryRowContext(ctx,
+		`WITH stale AS (
+		   UPDATE traces SET status = 'error',
+		     error = 'recovered: owning process stopped heartbeating (crash or restart)',
+		     end_time = NOW(), duration_ms = EXTRACT(EPOCH FROM (NOW() - start_time))::int * 1000
+		   WHERE status = 'running' AND COALESCE(last_activity_at, start_time) < $1
+		   RETURNING id
+		 ), stale_spans AS (
+		   UPDATE spans SET status = 'error', error = 'recovered: server restart',
+		     end_time = NOW(), duration_ms = EXTRACT(EPOCH FROM (NOW() - start_time))::int * 1000
+		   WHERE status = 'running' AND trace_id IN (SELECT id FROM stale)
+		   RETURNING 1
+		 )
+		 SELECT count(*) FROM stale`, cutoff).Scan(&recovered)
 	if err != nil {
 		return 0, fmt.Errorf("recover stale running traces: %w", err)
 	}
-	return res.RowsAffected()
+	return recovered, nil
 }

@@ -16,7 +16,7 @@ var schemaSQL string
 
 // SchemaVersion is the current SQLite schema version.
 // Bump this when adding new migration steps below.
-const SchemaVersion = 58
+const SchemaVersion = 59
 
 // migrations maps version → SQL to apply when upgrading FROM that version.
 // schema.sql always represents the LATEST full schema (for fresh DBs).
@@ -30,6 +30,11 @@ const SchemaVersion = 58
 //
 // Then bump SchemaVersion to 2.
 var migrations = map[int]string{
+	// Version 58 → 59: heartbeat column for stale-trace recovery. Mirrors
+	// migrations/000096_traces_last_activity_at.up.sql on the PG side.
+	58: `ALTER TABLE traces ADD COLUMN last_activity_at TEXT;
+CREATE INDEX IF NOT EXISTS idx_traces_running_activity ON traces(last_activity_at) WHERE status = 'running';`,
+
 	// Version 57 → 58: restore custom skills previously converted by the bundled skill seeder.
 	57: `UPDATE skills
 SET is_system = 0,

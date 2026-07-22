@@ -18,12 +18,10 @@ const (
 	previewMaxLen        = 40_000
 	traceRetention       = 7 * 24 * time.Hour // auto-delete traces older than 7 days
 	pruneInterval        = 8 * time.Hour
-	// staleThreshold: how long a "running" trace must be stuck before the recovery
-	// worker marks it as "error". 10min is conservative — the primary sub-second
-	// stop visibility is delivered by the trace.status WS event (Phase 4). Stale
-	// recovery is a safety net for crashed/orphaned traces. Lowering this further
-	// requires a `last_span_at` column so we don't sweep legitimate long-running
-	// agents (see plan's Phase 3 unresolved question).
+	// staleThreshold: how long a "running" trace must go without a heartbeat
+	// before the recovery worker marks it as "error". Must stay well above
+	// defaultFlushInterval so a slow flush cycle or a brief DB hiccup cannot
+	// make a live trace look abandoned. 10min gives a 120x margin.
 	staleThreshold = 10 * time.Minute
 	staleRecoveryPeriod  = 30 * time.Second // new: run periodically instead of once on startup
 	retryQueueCap        = 1000
@@ -96,6 +94,15 @@ type Collector struct {
 	dirtyTraces   map[uuid.UUID]struct{}
 	dirtyTracesMu sync.Mutex
 
+	// liveTraces are the traces this process created and has not finished.
+	// Every flush cycle stamps last_activity_at on them, which is the liveness
+	// signal stale recovery gates on: it keeps advancing while this process is
+	// alive — including across a long LLM call that emits no spans — and stops
+	// the moment the process dies. Entries are added by CreateTrace and removed
+	// when the trace reaches a terminal status.
+	liveTraces   map[uuid.UUID]struct{}
+	liveTracesMu sync.Mutex
+
 	verbose  bool         // when true, LLM spans include full input messages
 	exporter SpanExporter // optional external exporter (nil = disabled)
 
@@ -135,6 +142,7 @@ func NewCollector(ts store.TracingStore, usageStore ...store.UsageEventStore) *C
 		stopCh:       make(chan struct{}),
 		retryCh:      make(chan pendingUpdate, retryQueueCap),
 		dirtyTraces:  make(map[uuid.UUID]struct{}),
+		liveTraces:   make(map[uuid.UUID]struct{}),
 		verbose:      verbose,
 	}
 }
@@ -163,27 +171,21 @@ func (c *Collector) SetStatusBroadcaster(b StatusBroadcaster) {
 	c.broadcastStatus = b
 }
 
-// Start begins the background flush loop and retry worker.
+// Start begins the background flush loop, retry worker, and stale recovery.
 //
-// NOTE: staleRecoveryLoop is intentionally NOT started. The current implementation
-// sweeps traces by `start_time`, which would kill legitimate long-running agent
-// runs (research chains, large code generation, long shell commands routinely
-// exceed 10 minutes). Re-enable only after adding a `last_span_at` column so
-// recovery can gate on "no activity for N minutes" instead of "started > N min
-// ago". Until then, crashed/orphaned traces may remain `running` in DB — the
-// primary abort path (router 2-phase + trace.status WS event) handles the
-// common case; this is a safety-net gap we accept over false kills.
+// staleRecoveryLoop was previously disabled because it swept traces by
+// start_time, which killed legitimate long-running agent runs (research chains,
+// large code generation, long shell commands routinely exceed 10 minutes).
+// Recovery now gates on last_activity_at, a heartbeat each live process writes
+// for its own open traces every flush cycle, so a long run stays alive and only
+// a trace whose owner died goes stale.
 func (c *Collector) Start() {
-	c.wg.Add(2) // flushLoop + retryWorker (staleRecoveryLoop disabled — see note above)
+	c.wg.Add(3) // flushLoop + retryWorker + staleRecoveryLoop
 	go c.flushLoop()
 	go c.retryWorker()
-	// go c.staleRecoveryLoop() // disabled: would kill healthy long runs. See Start() godoc.
+	go c.staleRecoveryLoop()
 	slog.Info("tracing collector started")
 }
-
-// keep staleRecoveryLoop reachable to silence "unused" linter; re-enabled in
-// Start() once last_span_at-based recovery lands.
-var _ = (*Collector).staleRecoveryLoop
 
 // Stop gracefully shuts down the collector, flushing remaining spans.
 func (c *Collector) Stop() {
@@ -202,9 +204,45 @@ func (c *Collector) Stop() {
 	slog.Info("tracing collector stopped")
 }
 
-// CreateTrace synchronously creates a trace record.
+// CreateTrace synchronously creates a trace record and takes ownership of it
+// for heartbeating until it reaches a terminal status.
 func (c *Collector) CreateTrace(ctx context.Context, trace *store.TraceData) error {
-	return c.store.CreateTrace(ctx, trace)
+	if err := c.store.CreateTrace(ctx, trace); err != nil {
+		return err
+	}
+	c.trackLive(trace.ID)
+	return nil
+}
+
+// trackLive marks a trace as owned by this process.
+func (c *Collector) trackLive(traceID uuid.UUID) {
+	if traceID == uuid.Nil {
+		return
+	}
+	c.liveTracesMu.Lock()
+	c.liveTraces[traceID] = struct{}{}
+	c.liveTracesMu.Unlock()
+}
+
+// untrackLive releases ownership once a trace reaches a terminal status.
+func (c *Collector) untrackLive(traceID uuid.UUID) {
+	c.liveTracesMu.Lock()
+	delete(c.liveTraces, traceID)
+	c.liveTracesMu.Unlock()
+}
+
+// liveTraceIDs snapshots the traces this process still owns.
+func (c *Collector) liveTraceIDs() []uuid.UUID {
+	c.liveTracesMu.Lock()
+	defer c.liveTracesMu.Unlock()
+	if len(c.liveTraces) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(c.liveTraces))
+	for id := range c.liveTraces {
+		ids = append(ids, id)
+	}
+	return ids
 }
 
 // UpdateTrace synchronously updates a trace record.
@@ -267,6 +305,20 @@ func (c *Collector) SetTraceStatus(ctx context.Context, traceID uuid.UUID, statu
 	if c.updateTraceWithRetry(ctx, traceID, updates) {
 		c.markDirty(traceID)
 	}
+	if isTerminalTraceStatus(status) {
+		c.untrackLive(traceID)
+	}
+}
+
+// isTerminalTraceStatus reports whether a status ends the run, meaning this
+// process no longer needs to heartbeat the trace.
+func isTerminalTraceStatus(status string) bool {
+	switch status {
+	case store.TraceStatusCompleted, store.TraceStatusError, store.TraceStatusCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 // FinishTrace marks a trace as completed and schedules aggregate update.
@@ -286,6 +338,10 @@ func (c *Collector) FinishTrace(ctx context.Context, traceID uuid.UUID, status s
 	if c.updateTraceWithRetry(ctx, traceID, updates) {
 		c.markDirty(traceID)
 	}
+	// Unconditional: FinishTrace always ends the run, and a failed write must
+	// not leave this process heartbeating a trace forever. If the write did
+	// fail, stale recovery is the correct fallback.
+	c.untrackLive(traceID)
 }
 
 // updateTraceWithRetry persists trace updates with a detached ctx + 3 inline retries.
@@ -440,12 +496,8 @@ func (c *Collector) staleRecoveryLoop() {
 	}
 }
 
-// recoverStaleOnce marks "running" traces whose start_time is older than
-// staleThreshold (10 min) as "error". Also recovers stuck spans.
-//
-// NOTE: Both PG and SQLite implementations use start_time < cutoff, not last
-// activity time. Follow-up: gate on "no spans in last N min" instead (requires
-// a last_span_at schema column). Tracked as an open question.
+// recoverStaleOnce marks "running" traces whose owner has not heartbeated for
+// staleThreshold (10 min) as "error", along with their open spans.
 func (c *Collector) recoverStaleOnce() {
 	cutoff := time.Now().UTC().Add(-staleThreshold)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -580,6 +632,24 @@ doneUsage:
 			}
 			c.OnFlush(ids)
 		}
+	}
+
+	c.heartbeatLiveTraces()
+}
+
+// heartbeatLiveTraces stamps last_activity_at on every trace this process still
+// owns. Runs each flush cycle, independently of whether spans were produced —
+// that is the point: a run sitting in a single long LLM call emits nothing, and
+// must still look alive to stale recovery.
+func (c *Collector) heartbeatLiveTraces() {
+	ids := c.liveTraceIDs()
+	if len(ids) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := c.store.TouchTracesActivity(ctx, ids, time.Now().UTC()); err != nil {
+		slog.Warn("tracing: heartbeat failed", "count", len(ids), "error", err)
 	}
 }
 

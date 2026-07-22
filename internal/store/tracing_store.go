@@ -183,8 +183,15 @@ type TracingStore interface {
 
 	// Maintenance
 	DeleteTracesOlderThan(ctx context.Context, cutoff time.Time) (int64, error)
-	// RecoverStaleRunningTraces marks traces stuck in "running" since before cutoff as "error".
-	// Returns count of recovered traces. Called on startup to fix orphans from crashes.
+	// TouchTracesActivity stamps last_activity_at on the given running traces.
+	// The owning process calls this every flush cycle for the traces it still
+	// has open, which is what lets RecoverStaleRunningTraces tell a live long
+	// run apart from an orphan left behind by a crash.
+	TouchTracesActivity(ctx context.Context, traceIDs []uuid.UUID, at time.Time) error
+
+	// RecoverStaleRunningTraces marks traces stuck in "running" whose owner has
+	// not heartbeated since cutoff as "error". Traces that never heartbeated
+	// fall back to start_time. Returns count of recovered traces.
 	RecoverStaleRunningTraces(ctx context.Context, cutoff time.Time) (int64, error)
 
 	// ListCodexPoolSpans returns recent LLM call spans for agents using Codex OAuth pool providers.
