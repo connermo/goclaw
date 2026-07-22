@@ -14,6 +14,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	"github.com/nextlevelbuilder/goclaw/internal/heartbeat"
+	"github.com/nextlevelbuilder/goclaw/internal/runtime"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/security"
@@ -149,7 +150,11 @@ func (d *gatewayDeps) runLifecycle(
 		d.channelMgr.SetContactCollector(contactCollector)
 	}
 
-	go consumeInboundMessages(ctx, d.msgBus, d.agentRouter, d.cfg, deps.sched, d.channelMgr, deps.consumerTeamStore, d.pgStores.AgentLinks, deps.quotaChecker, d.pgStores.Sessions, d.pgStores.Agents, contactCollector, deps.postTurn, deps.subagentMgr, d.usageCapSvc, d.providerRegistry, d.teamWorkEmbedder)
+	// Inbound message consumer dispatches channel events into agent loops.
+	// Worker-only: paired with channel pollers, which are also worker-only.
+	if runtime.IsWorker() {
+		go consumeInboundMessages(ctx, d.msgBus, d.agentRouter, d.cfg, deps.sched, d.channelMgr, deps.consumerTeamStore, d.pgStores.AgentLinks, deps.quotaChecker, d.pgStores.Sessions, d.pgStores.Agents, contactCollector, deps.postTurn, deps.subagentMgr, d.usageCapSvc, d.providerRegistry, d.teamWorkEmbedder)
+	}
 
 	// Webhook callback worker — delivers async webhook_calls rows to receiver callback_url.
 	// Runs in both editions: Standard (PG, concurrency=4) and Lite (SQLite, concurrency=1).
@@ -186,8 +191,9 @@ func (d *gatewayDeps) runLifecycle(
 	}
 
 	// Task recovery ticker: re-dispatches stale/pending team tasks on startup and periodically.
+	// Worker-only: ticker goroutine; running on N pods would duplicate dispatches.
 	var taskTicker *tasks.TaskTicker
-	if d.pgStores.Teams != nil {
+	if runtime.IsWorker() && d.pgStores.Teams != nil {
 		taskTicker = tasks.NewTaskTicker(d.pgStores.Teams, d.pgStores.Agents, d.msgBus, d.cfg.Gateway.TaskRecoveryIntervalSec)
 		taskTicker.Start()
 	}
@@ -199,12 +205,17 @@ func (d *gatewayDeps) runLifecycle(
 		// Broadcast shutdown event
 		d.server.BroadcastEvent(*protocol.NewEvent(protocol.EventShutdown, nil))
 
-		// Stop channels, cron, heartbeat, and task ticker
-		d.channelMgr.StopAll(context.Background())
-		d.pgStores.Cron.Stop()
-		deps.heartbeatTicker.Stop()
-		if taskTicker != nil {
-			taskTicker.Stop()
+		// Stop channels, cron, heartbeat, and task ticker (worker-only — these
+		// were not started on api pods).
+		if runtime.IsWorker() {
+			d.channelMgr.StopAll(context.Background())
+			d.pgStores.Cron.Stop()
+			if deps.heartbeatTicker != nil {
+				deps.heartbeatTicker.Stop()
+			}
+			if taskTicker != nil {
+				taskTicker.Stop()
+			}
 		}
 
 		// Stop webhook callback worker — signals Run() to drain in-flight and exit.
@@ -306,6 +317,21 @@ func (d *gatewayDeps) runLifecycle(
 		}
 	}
 
+	// Readiness check: DB ping. K8s probes /ready before routing traffic.
+	// Sub-second timeout enforced by handleReady.
+	d.server.SetReadyFn(func(ctx context.Context) error {
+		if d.pgStores != nil && d.pgStores.DB != nil {
+			if err := d.pgStores.DB.PingContext(ctx); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// HTTP listener runs in all roles so k8s probes (/health, /ready) and
+	// in-cluster RPC always work. In worker-only mode no Service should route
+	// external traffic here — rely on NetworkPolicy / Service selector to
+	// scope inbound API traffic to api pods.
 	if err := d.server.Start(ctx); err != nil {
 		slog.Error("gateway error", "error", err)
 		os.Exit(1)

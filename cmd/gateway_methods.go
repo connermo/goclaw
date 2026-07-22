@@ -54,6 +54,12 @@ func registerAllMethods(server *gateway.Server, agents *agent.Router, sessStore 
 	// Wire cache-aware resolver so heartbeat can accept agent_key or UUID
 	// without a DB roundtrip on the hot path when the agent is router-cached.
 	heartbeatMethods.SetAgentRouter(agents)
+	// Agent store is required on every role that registers RPC handlers (api +
+	// worker), since heartbeat.get/set resolve agentId via DB lookup. The
+	// worker-only startCronAndHeartbeat path also calls SetAgentStore (via the
+	// ticker setup), but RPC handlers must work on api pods which never run
+	// the cron path — wire it here unconditionally.
+	heartbeatMethods.SetAgentStore(agentStore)
 	heartbeatMethods.Register(router)
 
 	// Phase 2: Config permissions
