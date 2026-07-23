@@ -34,10 +34,10 @@ Things like:
 ## Media Files
 
 Images, videos, and audio are the message itself — use the `read_*` tools to perceive them.
-A document is an attached file, even though its tag carries a path: don't open, read, or run any
-tool on it on arrival. Only access it (`read_document`, `read_file`, `exec`, skills) when the
-request is actually about the file's contents. For perceiving images/audio/video, the `path`/`id`
-in the tag goes straight to the matching `read_*` tool.
+A document is an attached file: don't read or run any tool on it on arrival. Only when the request
+is about the file's contents, read it with `read_document` — that tool finds the attachment on its
+own, so call it with no path (don't guess a filename with `read_file`). It returns the file's real
+path if you then need a skill to process the raw file.
 
 ## Why Separate?
 

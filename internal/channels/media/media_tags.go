@@ -38,11 +38,16 @@ func BuildMediaTags(mediaList []MediaInfo) string {
 				tag = "<media:voice>"
 			}
 		case TypeDocument:
+			// Name only, never a path: a path in the prompt invites reading the
+			// file on arrival. The parenthetical steers the model to the right
+			// tool — and only on request — so it doesn't guess a filename with
+			// read_file. read_document locates the attachment itself.
 			if m.FileName != "" {
 				tag = fmt.Sprintf("<media:document name=%q>", m.FileName)
 			} else {
 				tag = "<media:document>"
 			}
+			tag += " (attached file — if the user asks about its contents, read it with read_document, no path needed)"
 		}
 		if tag != "" {
 			if m.FromReply {

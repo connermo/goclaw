@@ -157,12 +157,10 @@ func (l *Loop) enrichInputMedia(ctx context.Context, req *RunRequest, messages [
 		}
 		if len(mediaPaths) > 0 {
 			ctx = tools.WithRunMediaPaths(ctx, mediaPaths)
-			// Extract original filenames from <media:document name="X" path="Y"> tags
-			// in the last user message (enriched in step 2b above).
-			if lastMsg := messages[len(messages)-1]; lastMsg.Role == "user" {
-				if nameMap := tools.ExtractMediaNameMap(lastMsg.Content); len(nameMap) > 0 {
-					ctx = tools.WithRunMediaNames(ctx, nameMap)
-				}
+			// Clean display names for team-workspace attachments, derived from the
+			// persisted paths (the document tag no longer carries a path).
+			if nameMap := tools.MediaNameMapFromRefs(mediaRefs); len(nameMap) > 0 {
+				ctx = tools.WithRunMediaNames(ctx, nameMap)
 			}
 		}
 	}

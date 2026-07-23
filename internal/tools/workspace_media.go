@@ -6,33 +6,24 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
+
+	"github.com/nextlevelbuilder/goclaw/internal/providers"
 )
 
-// mediaDocNameRe extracts name and path attributes from <media:document> tags.
-var mediaDocNameRe = regexp.MustCompile(`<media:document\b[^>]*\bname="([^"]+)"[^>]*\bpath="([^"]+)"`)
-
-// mediaDocPathNameRe matches path-before-name ordering and Slack file= variant.
-var mediaDocPathNameRe = regexp.MustCompile(`<media:document\b[^>]*\bpath="([^"]+)"[^>]*\b(?:name|file)="([^"]+)"`)
-
-
-// ExtractMediaNameMap parses message content for <media:document name="X" path="Y"> tags
-// and returns a map from absolute file path to original filename.
-func ExtractMediaNameMap(content string) map[string]string {
+// MediaNameMapFromRefs returns a map from each ref's absolute path to a clean
+// display filename. The document path is no longer carried in the <media:document>
+// tag (it would invite reading the file on arrival), so the name is recovered
+// from the persisted path's basename, dropping the "-<8hex>" upload suffix
+// persistMedia adds. Used so team-workspace attachments keep readable names
+// instead of the on-disk UUID-suffixed ones.
+func MediaNameMapFromRefs(refs []providers.MediaRef) map[string]string {
 	nameMap := make(map[string]string)
-	for _, m := range mediaDocNameRe.FindAllStringSubmatch(content, -1) {
-		if len(m) == 3 {
-			nameMap[m[2]] = m[1] // path → name
+	for _, ref := range refs {
+		if ref.Kind != "document" || ref.Path == "" {
+			continue
 		}
-	}
-	// Also match path-before-name ordering and Slack file= variant.
-	for _, m := range mediaDocPathNameRe.FindAllStringSubmatch(content, -1) {
-		if len(m) == 3 {
-			if _, exists := nameMap[m[1]]; !exists {
-				nameMap[m[1]] = m[2] // path → name
-			}
-		}
+		nameMap[ref.Path] = stripUploadShortID(filepath.Base(ref.Path))
 	}
 	return nameMap
 }

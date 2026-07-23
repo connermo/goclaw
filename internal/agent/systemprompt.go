@@ -674,7 +674,7 @@ func buildToolingSection(toolNames []string, hasSandbox bool, shellDenyGroups ma
 			"",
 			"### Media Files",
 			`Images, video, and audio ARE the message: when you see <media:image path="...">, <media:video id="...">, or <media:audio id="...">, use the corresponding read_* tool to perceive them.`,
-			`A <media:document ...> tag is an attached file, NOT a request to analyze it — even though the tag carries a path. Do not open, read, extract, or run ANY tool on that file (read_document, read_file, exec, skills) just because it arrived. Access it only when the user's message actually asks about its contents — before or after the upload. With no such request, simply acknowledge you received it and wait.`,
+			`A <media:document ...> tag is an attached file, NOT a request to analyze it. Do not read, extract, or run any tool on it just because it arrived — with no request about its contents, simply acknowledge you received it and wait. When the user DOES ask about the file (before or after the upload), read it with read_document: that tool locates the attachment itself, so call it with no path — do NOT guess a filename with read_file or exec. read_document returns the file's real path in its result if you then need a skill to process the raw file.`,
 			"You have full vision/audio/video capabilities. NEVER say you cannot see images or files.",
 		)
 	}
