@@ -53,18 +53,19 @@ func (c *Channel) resolveMedia(files []slackapi.File) (items []mediaItem, extraC
 			ContentType: f.Mimetype,
 		})
 
-		// Extract text from document files
+		// Announce the document; the model reads it with read_document if the
+		// request actually calls for it.
 		if mtype == "document" {
-			docContent, err := media.ExtractDocumentContent(filePath, f.Name)
+			notice, err := media.DescribeDocument(filePath, f.Name)
 			if err != nil {
-				slog.Warn("slack: document extraction failed",
+				slog.Warn("slack: document describe failed",
 					"file", f.Name, "error", err)
 				continue
 			}
 			if extraContent != "" {
 				extraContent += "\n"
 			}
-			extraContent += docContent
+			extraContent += notice
 		}
 	}
 

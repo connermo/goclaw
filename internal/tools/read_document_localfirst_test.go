@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -61,8 +62,13 @@ func TestReadDocument_LocalHitReturnsTextWithNoSpend(t *testing.T) {
 	if !parser.extractCalled {
 		t.Fatal("expected Extract to be called on a supported mime")
 	}
-	if result.ForLLM != "EXTRACTED DOCUMENT TEXT" {
-		t.Errorf("ForLLM = %q, want extracted text", result.ForLLM)
+	// Result carries the extracted text plus a path header (plan C: the path is
+	// withheld on arrival, surfaced here after a sanctioned read).
+	if !strings.Contains(result.ForLLM, "EXTRACTED DOCUMENT TEXT") {
+		t.Errorf("ForLLM = %q, want it to contain extracted text", result.ForLLM)
+	}
+	if !strings.Contains(result.ForLLM, "document path:") {
+		t.Errorf("ForLLM = %q, want a document path header", result.ForLLM)
 	}
 	if result.Usage != nil {
 		t.Errorf("local hit must report no Usage, got %+v", result.Usage)

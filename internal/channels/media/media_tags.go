@@ -8,9 +8,6 @@ import (
 	"strings"
 )
 
-// docMaxChars is the max characters to extract from text documents (matching TS: 200K).
-const docMaxChars = 200_000
-
 // BuildMediaTags generates content tags for media items (matching TS media placeholder format).
 // For audio/voice items that have been transcribed, the transcript is embedded in a <transcript> block.
 // Items with FromReply=true are annotated with "(from replied message)" so the LLM can distinguish
@@ -89,41 +86,52 @@ var textExtensions = map[string]string{
 	".toml": "text/x-toml",
 }
 
-// ExtractDocumentContent reads a document file and returns its content wrapped in XML tags.
-// For text files: extracts content, truncates at docMaxChars, wraps in <file> block.
-// For binary files: returns a placeholder hint directing to the read_document tool.
-func ExtractDocumentContent(filePath, fileName string) (string, error) {
+// DescribeDocument returns a one-line notice announcing an uploaded document:
+// what it is, how big it is, and which tool opens it.
+//
+// It deliberately does not read the file. Uploading a document is not the same
+// as asking for it to be analyzed — someone may attach a log and then ask an
+// unrelated question, or send a file simply to store it. Inlining the content
+// answered that question on the model's behalf, and spent up to 200K chars of
+// context doing so. The model can see what arrived and decide for itself.
+//
+// Text files used to be inlined here while binary files already got a hint;
+// both now take the same path, so "was it parsed?" no longer depends on the
+// file extension.
+func DescribeDocument(filePath, fileName string) (string, error) {
 	if filePath == "" {
 		return fmt.Sprintf("[File: %s — download failed]", fileName), nil
 	}
 
 	ext := strings.ToLower(filepath.Ext(fileName))
-	mime, isText := textExtensions[ext]
-	if !isText {
-		// Binary files (PDF, DOCX, etc.) are persisted via MediaRef and analyzed
-		// by the read_document tool. Return a hint instead of "not supported" placeholder.
-		if isArchiveFileName(fileName) {
-			return fmt.Sprintf("[Archive: %s — use exec with the path from the <media:document> tag to inspect or extract this archive]", fileName), nil
-		}
-		return fmt.Sprintf("[File: %s — use read_document tool to analyze this file]", fileName), nil
+	kind := "binary"
+	if mime, isText := textExtensions[ext]; isText {
+		kind = mime
 	}
 
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return "", fmt.Errorf("read file %s: %w", fileName, err)
+	var size string
+	if fi, err := os.Stat(filePath); err == nil {
+		size = ", " + humanSize(fi.Size())
 	}
 
-	content := string(data)
-
-	// Truncate if too long
-	if len(content) > docMaxChars {
-		content = content[:docMaxChars] + "\n... [truncated]"
+	if isArchiveFileName(fileName) {
+		return fmt.Sprintf("[Archive received: %s (archive%s). Not extracted. Use exec to inspect or extract it if the request calls for that.]",
+			fileName, size), nil
 	}
+	return fmt.Sprintf("[File received: %s (%s%s). Not parsed. Use read_document to read it if the request calls for that.]",
+		fileName, kind, size), nil
+}
 
-	// XML escape content to prevent injection
-	escaped := html.EscapeString(content)
-
-	return fmt.Sprintf("<file name=%q mime=%q>\n%s\n</file>", fileName, mime, escaped), nil
+// humanSize renders a byte count for the notice line.
+func humanSize(n int64) string {
+	switch {
+	case n >= 1<<20:
+		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
+	case n >= 1<<10:
+		return fmt.Sprintf("%.1f KB", float64(n)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", n)
+	}
 }
 
 func isArchiveFileName(fileName string) bool {
