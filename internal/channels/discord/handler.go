@@ -148,11 +148,11 @@ func (c *Channel) handleMessage(_ *discordgo.Session, m *discordgo.MessageCreate
 
 			case media.TypeDocument:
 				if mi.FileName != "" && mi.FilePath != "" {
-					docContent, err := media.ExtractDocumentContent(mi.FilePath, mi.FileName)
+					notice, err := media.DescribeDocument(mi.FilePath, mi.FileName)
 					if err != nil {
-						slog.Warn("discord: document extraction failed", "file", mi.FileName, "error", err)
-					} else if docContent != "" {
-						extraContent.WriteString("\n\n" + docContent)
+						slog.Warn("discord: document describe failed", "file", mi.FileName, "error", err)
+					} else if notice != "" {
+						extraContent.WriteString("\n\n" + notice)
 					}
 				}
 			}

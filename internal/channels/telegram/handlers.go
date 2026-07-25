@@ -522,11 +522,11 @@ func (c *Channel) processResolvedMessage(ctx context.Context, rctx resolvedMessa
 				}
 			case "document":
 				if m.FileName != "" && m.FilePath != "" {
-					docContent, err := extractDocumentContent(m.FilePath, m.FileName)
+					notice, err := describeDocument(m.FilePath, m.FileName)
 					if err != nil {
-						slog.Warn("document extraction failed", "file", m.FileName, "error", err)
-					} else if docContent != "" {
-						extraContent.WriteString("\n\n" + docContent)
+						slog.Warn("document describe failed", "file", m.FileName, "error", err)
+					} else if notice != "" {
+						extraContent.WriteString("\n\n" + notice)
 					}
 				}
 			case "video", "animation":

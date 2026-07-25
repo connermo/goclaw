@@ -211,7 +211,7 @@ var coreToolSummaries = map[string]string{
 	"read_audio":             "Analyze audio — call with media_id from <media:audio> tags",
 	"read_video":             "Analyze video — call with media_id from <media:video> tags, or a direct HTTP/HTTPS URL via the 'url' parameter",
 	"create_video":           "Generate videos from text descriptions using AI",
-	"read_document":          "Analyze documents (PDF, DOCX) from <media:document> tags. If fails, use a skill instead. Path is directly accessible",
+	"read_document":          "Read an attached document (PDF, DOCX, text/code files) from a <media:document> tag — call ONLY when the user asks about its contents, not on arrival. If it fails, use a skill instead. Path is directly accessible",
 	"create_image":           "Generate images from text descriptions using AI",
 	"create_audio":           "Generate music or sound effects from text descriptions using AI",
 	"knowledge_graph_search": "Find people, projects, and their connections — use for relationship questions (who works with whom, project dependencies) that memory_search may miss",
@@ -673,7 +673,8 @@ func buildToolingSection(toolNames []string, hasSandbox bool, shellDenyGroups ma
 		lines = append(lines,
 			"",
 			"### Media Files",
-			`When users send media (<media:image path="...">, <media:video id="...">, <media:audio id="...">, <media:document path="...">), use the corresponding read_* tool with the path/media_id. For archives (.zip, .tar.gz, etc.), use exec with the document path to inspect/extract the archive.`,
+			`Images, video, and audio ARE the message: when you see <media:image path="...">, <media:video id="...">, or <media:audio id="...">, use the corresponding read_* tool to perceive them.`,
+			`A <media:document ...> tag is an attached file, NOT a request to analyze it. Do not read, extract, or run any tool on it just because it arrived — with no request about its contents, simply acknowledge you received it and wait. When the user DOES ask about the file (before or after the upload), read it with read_document: that tool locates the attachment itself, so call it with no path — do NOT guess a filename with read_file or exec. read_document returns the file's real path in its result if you then need a skill to process the raw file.`,
 			"You have full vision/audio/video capabilities. NEVER say you cannot see images or files.",
 		)
 	}

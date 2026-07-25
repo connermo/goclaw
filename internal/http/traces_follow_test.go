@@ -64,6 +64,9 @@ func (m *mockTracingStore) DeleteTracesOlderThan(context.Context, time.Time) (in
 func (m *mockTracingStore) RecoverStaleRunningTraces(context.Context, time.Time) (int64, error) {
 	return 0, nil
 }
+func (m *mockTracingStore) TouchTracesActivity(context.Context, []uuid.UUID, time.Time) error {
+	return nil
+}
 func (m *mockTracingStore) ListCodexPoolSpans(context.Context, uuid.UUID, uuid.UUID, []string, int) ([]store.CodexPoolSpan, error) {
 	return nil, nil
 }

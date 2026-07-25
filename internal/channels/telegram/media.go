@@ -378,9 +378,9 @@ func prependMediaInfoFiles(current []bus.MediaFile, history []MediaInfo) []bus.M
 	return append(ordered, current...)
 }
 
-// extractDocumentContent delegates to the shared media package.
-func extractDocumentContent(filePath, fileName string) (string, error) {
-	return media.ExtractDocumentContent(filePath, fileName)
+// describeDocument delegates to the shared media package.
+func describeDocument(filePath, fileName string) (string, error) {
+	return media.DescribeDocument(filePath, fileName)
 }
 
 // lightweightMediaTags builds descriptive media placeholders from Telegram message metadata

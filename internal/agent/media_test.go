@@ -232,25 +232,6 @@ func TestEnrichImagePaths_MultipleRefsKeepTagAlignment(t *testing.T) {
 	}
 }
 
-func TestEnrichDocumentPaths_MultipleRefs(t *testing.T) {
-	messages := []providers.Message{{
-		Role:    "user",
-		Content: "first <media:document>\nsecond <media:document>",
-	}}
-	refs := []providers.MediaRef{
-		{ID: "doc-a", Kind: "document", Path: "/tmp/a.pdf"},
-		{ID: "doc-b", Kind: "document", Path: "/tmp/b.pdf"},
-	}
-
-	var loop Loop
-	loop.enrichDocumentPaths(messages, refs)
-
-	want := `first <media:document path="/tmp/a.pdf">` + "\n" + `second <media:document path="/tmp/b.pdf">`
-	if messages[0].Content != want {
-		t.Fatalf("multi-ref alignment:\n got %q\nwant %q", messages[0].Content, want)
-	}
-}
-
 func TestEnrichAudioIDs_MultipleRefs(t *testing.T) {
 	messages := []providers.Message{{
 		Role:    "user",

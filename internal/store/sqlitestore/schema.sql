@@ -579,9 +579,14 @@ CREATE TABLE IF NOT EXISTS traces (
     parent_trace_id     TEXT,
     team_id             TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
     tenant_id           TEXT NOT NULL REFERENCES tenants(id),
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    -- Heartbeat written by the owning process each flush cycle; stale-trace
+    -- recovery gates on it. NULL = never heartbeated, readers fall back to
+    -- start_time. See migrations/000096_traces_last_activity_at.up.sql.
+    last_activity_at    TEXT
 );
 
+CREATE INDEX IF NOT EXISTS idx_traces_running_activity ON traces(last_activity_at) WHERE status = 'running';
 CREATE INDEX IF NOT EXISTS idx_traces_agent_time ON traces(agent_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_user_time ON traces(user_id, created_at DESC) WHERE user_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_key, created_at DESC) WHERE session_key IS NOT NULL;

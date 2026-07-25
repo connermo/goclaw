@@ -299,52 +299,6 @@ func copyMediaFile(src, dst string) error {
 	return out.Close()
 }
 
-// enrichDocumentPaths updates the last user message to include persisted file paths
-// in <media:document> tags. This allows skills (e.g. pdf skill via exec) to access
-// the file directly, matching how Claude Code skills work with file paths.
-func (l *Loop) enrichDocumentPaths(messages []providers.Message, refs []providers.MediaRef) {
-	if len(messages) == 0 {
-		return
-	}
-	lastIdx := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			lastIdx = i
-			break
-		}
-	}
-	if lastIdx < 0 {
-		return
-	}
-
-	content := messages[lastIdx].Content
-	for _, ref := range refs {
-		if ref.Kind != "document" {
-			continue
-		}
-		p := ref.Path
-		if p == "" && l.mediaStore != nil {
-			var err error
-			p, err = l.mediaStore.LoadPath(ref.ID)
-			if err != nil {
-				continue
-			}
-		}
-		if p == "" {
-			continue
-		}
-		pathAttr := fmt.Sprintf(" path=%q", p)
-
-		// Match first <media:document> without a path — covers bare, named, and file= variants.
-		content, _ = replaceFirstMediaTag(content, "<media:document", func(tag string) bool {
-			return !tagHasAttr(tag, "path")
-		}, func(tag string) string {
-			return appendTagAttrs(tag, pathAttr)
-		})
-	}
-	messages[lastIdx].Content = content
-}
-
 // enrichAudioIDs updates the last user message to embed persisted media IDs
 // in <media:audio> and <media:voice> tags so the LLM can reference them.
 func (l *Loop) enrichAudioIDs(messages []providers.Message, refs []providers.MediaRef) {

@@ -29,6 +29,14 @@ var textReadableMIMEs = map[string]bool{
 // documentMaxTextBytes is the max size for direct text return (500KB).
 const documentMaxTextBytes = 500 * 1024
 
+// documentPathHeader prefixes a read result with the resolved file path. The
+// path is withheld from the <media:document> tag on arrival so the model does
+// not read the file unprompted; it is surfaced here, after a sanctioned read,
+// so a follow-up skill can operate on the raw file via exec.
+func documentPathHeader(path string) string {
+	return fmt.Sprintf("[document path: %s — pass this to exec if a skill needs the raw file]\n\n", path)
+}
+
 // --- Context helpers for media documents ---
 
 const ctxMediaDocRefs toolContextKey = "tool_media_doc_refs"
@@ -156,7 +164,7 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 			content = content[:documentMaxTextBytes] + docTruncationMarker
 		}
 		slog.Info("read_document: returning text content directly", "mime", docMime, "size", len(data))
-		return NewResult(content)
+		return NewResult(documentPathHeader(docPath) + content)
 	}
 
 	// Local-first extraction (opt-in): for PDF/DOCX with an available local
@@ -172,7 +180,7 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 			slog.Warn("security.read_document_local_path_rejected", "path", docPath, "reason", verr.Error())
 		} else if text, err := t.localParser.Extract(ctx, safePath, docMime); err == nil {
 			slog.Info("read_document: local extraction hit", "mime", docMime, "bytes", len(text))
-			return NewResult(text) // no Provider/Model/Usage => no LLM spend
+			return NewResult(documentPathHeader(docPath) + text) // no Provider/Model/Usage => no LLM spend
 		} else {
 			slog.Info("read_document: local extraction miss, falling back", "mime", docMime, "reason", err.Error())
 		}
@@ -196,7 +204,7 @@ func (t *ReadDocumentTool) Execute(ctx context.Context, args map[string]any) *Re
 		return ErrorResult(fmt.Sprintf("Document analysis failed: %v", err))
 	}
 
-	result := NewResult(string(chainResult.Data))
+	result := NewResult(documentPathHeader(docPath) + string(chainResult.Data))
 	result.Usage = chainResult.Usage
 	result.Provider = chainResult.Provider
 	result.Model = chainResult.Model

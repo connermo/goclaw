@@ -112,9 +112,12 @@ func (l *Loop) enrichInputMedia(ctx context.Context, req *RunRequest, messages [
 	// 2b. Collect document MediaRefs (historical + current) for read_document tool.
 	if docRefs := collectRefsByKind(messages, mediaRefs, "document"); len(docRefs) > 0 {
 		ctx = tools.WithMediaDocRefs(ctx, docRefs)
-		// Enrich the last user message with persisted file paths so skills can access
-		// documents via exec (e.g. pypdf). Only for current-turn refs (just persisted).
-		l.enrichDocumentPaths(messages, mediaRefs)
+		// Deliberately NOT enriching the <media:document> tag with the file path.
+		// An uploaded document is an attachment, not a request to analyze it, and a
+		// path sitting in the prompt is an open invitation to cat/read_file it on
+		// arrival — which no wording reliably suppresses. read_document resolves the
+		// path itself from the refs above, and hands it back in its result, so a
+		// skill that needs the path via exec gets it once the user actually asks.
 	}
 
 	// 2c. Collect audio MediaRefs (historical + current) for read_audio tool.
@@ -154,12 +157,10 @@ func (l *Loop) enrichInputMedia(ctx context.Context, req *RunRequest, messages [
 		}
 		if len(mediaPaths) > 0 {
 			ctx = tools.WithRunMediaPaths(ctx, mediaPaths)
-			// Extract original filenames from <media:document name="X" path="Y"> tags
-			// in the last user message (enriched in step 2b above).
-			if lastMsg := messages[len(messages)-1]; lastMsg.Role == "user" {
-				if nameMap := tools.ExtractMediaNameMap(lastMsg.Content); len(nameMap) > 0 {
-					ctx = tools.WithRunMediaNames(ctx, nameMap)
-				}
+			// Clean display names for team-workspace attachments, derived from the
+			// persisted paths (the document tag no longer carries a path).
+			if nameMap := tools.MediaNameMapFromRefs(mediaRefs); len(nameMap) > 0 {
+				ctx = tools.WithRunMediaNames(ctx, nameMap)
 			}
 		}
 	}

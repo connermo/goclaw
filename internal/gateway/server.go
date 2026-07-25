@@ -113,6 +113,20 @@ type Server struct {
 	// so test servers don't share state. Read by RPC methods that need to
 	// advertise URLs back to external systems (e.g. Bitrix24 install link).
 	publicURLSnapshot *PublicURLSnapshot
+
+	// readyFn is consulted by /ready. nil means "ready as soon as listener is up".
+	// Lifecycle code installs a role-aware closure (DB ping for api; DB + channel
+	// manager started + cron loop running for worker).
+	readyFn func(context.Context) error
+	readyMu sync.RWMutex
+}
+
+// SetReadyFn installs a closure used by GET /ready. Pass nil to clear.
+// The closure should be cheap (sub-second). It receives the request context.
+func (s *Server) SetReadyFn(fn func(context.Context) error) {
+	s.readyMu.Lock()
+	s.readyFn = fn
+	s.readyMu.Unlock()
 }
 
 // SetPostTurnProcessor sets the post-turn processor for team task dispatch in HTTP API handlers.
@@ -200,6 +214,7 @@ func (s *Server) BuildMux() *http.ServeMux {
 
 	// HTTP API endpoints
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 
 	// OpenAI-compatible chat completions
 	isManaged := s.agentStore != nil
@@ -558,7 +573,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	client.Run(r.Context())
 }
 
-// handleHealth returns a simple health check response.
+// handleHealth returns a simple health check response (liveness).
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -581,6 +596,32 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		`{"service":"goclaw","status":"ok","protocol":%d,`+
 			`"endpoints":["/health","/v1/chat/completions","/v1/responses","/v1/tools/invoke","/ws"]}`,
 		protocol.ProtocolVersion)
+}
+
+// handleReady runs the registered readiness closure (typically: DB ping for
+// api, plus channel manager / cron started for worker). Returns 503 if the
+// closure errors, 200 otherwise. If no closure is installed it falls back to
+// the same behavior as /health so deployments without lifecycle wiring still
+// pass probes.
+func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
+	s.readyMu.RLock()
+	fn := s.readyFn
+	s.readyMu.RUnlock()
+	w.Header().Set("Content-Type", "application/json")
+	if fn == nil {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status":"ok"}`)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := fn(ctx); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, `{"status":"not_ready","error":%q}`, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"ready"}`)
 }
 
 // clientIP extracts the real client IP from the request, checking proxy headers first.
@@ -1050,6 +1091,7 @@ func StartTestServer(s *Server, ctx context.Context) (addr string, start func())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/ready", s.handleReady)
 
 	isManaged := s.agentStore != nil
 	chatHandler := httpapi.NewChatCompletionsHandler(s.agents, s.sessions, isManaged)

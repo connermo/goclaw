@@ -33,8 +33,11 @@ Things like:
 
 ## Media Files
 
-When users send images, videos, audio, or documents, use the `read_*` tools to analyze them.
-The `path` attribute in media tags points to the file — pass it directly to the tool.
+Images, videos, and audio are the message itself — use the `read_*` tools to perceive them.
+A document is an attached file: don't read or run any tool on it on arrival. Only when the request
+is about the file's contents, read it with `read_document` — that tool finds the attachment on its
+own, so call it with no path (don't guess a filename with `read_file`). It returns the file's real
+path if you then need a skill to process the raw file.
 
 ## Why Separate?
 

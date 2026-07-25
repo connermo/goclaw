@@ -22,6 +22,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channelmemory"
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/bitrix24"
+	"github.com/nextlevelbuilder/goclaw/internal/channels/dingtalk"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/discord"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/facebook"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/feishu"
@@ -37,6 +38,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/eventbus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway/methods"
+	"github.com/nextlevelbuilder/goclaw/internal/heartbeat"
 	"github.com/nextlevelbuilder/goclaw/internal/hooks"
 	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	kg "github.com/nextlevelbuilder/goclaw/internal/knowledgegraph"
@@ -44,6 +46,7 @@ import (
 	mcpoauth "github.com/nextlevelbuilder/goclaw/internal/mcp/oauth"
 	"github.com/nextlevelbuilder/goclaw/internal/media"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
+	"github.com/nextlevelbuilder/goclaw/internal/runtime"
 	"github.com/nextlevelbuilder/goclaw/internal/scheduler"
 	"github.com/nextlevelbuilder/goclaw/internal/security"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
@@ -226,6 +229,9 @@ func runGateway() {
 		}
 	}
 
+	role := runtime.Current()
+	slog.Info("runtime role", "role", string(role))
+
 	// Create core components
 	msgBus := bus.New()
 
@@ -383,8 +389,11 @@ func runGateway() {
 	// Fallback: background.provider → agent.default_provider → first registered provider.
 	bgProvider, bgModel := resolveBackgroundProvider(cfg, providerRegistry)
 
-	// V3: Wire consolidation pipeline (episodic → semantic → KG → dreaming)
-	if pgStores.Episodic != nil {
+	// V3: Wire consolidation pipeline (episodic → semantic → KG → dreaming).
+	// Worker-only: runs background event subscribers. With multi-pod (api+worker)
+	// the EventBus is in-process, so events emitted by api pods will not reach
+	// these subscribers. That gap is acceptable for MVP — see plan §12.
+	if runtime.IsWorker() && pgStores.Episodic != nil {
 		if bgProvider != nil {
 			var kgExtractor *kg.Extractor
 			if pgStores.KnowledgeGraph != nil {
@@ -421,9 +430,10 @@ func runGateway() {
 
 	// V3: Wire vault enrichment worker (async summary + embedding + auto-linking).
 	// Provider is resolved per-tenant at runtime — no static provider needed.
+	// Worker-only: background goroutine consumer.
 	var enrichProgress *vault.EnrichProgress
 	var enrichWorker *vault.EnrichWorker
-	if pgStores.Vault != nil && providerRegistry != nil {
+	if runtime.IsWorker() && pgStores.Vault != nil && providerRegistry != nil {
 		cleanupVaultEnrich, ep, ew := vault.RegisterEnrichWorker(vault.EnrichWorkerDeps{
 			VaultStore:    pgStores.Vault,
 			SystemConfigs: pgStores.SystemConfigs,
@@ -843,14 +853,17 @@ func runGateway() {
 	}
 
 	// Load channel instances from DB.
+	// Worker-only: channel pollers/clients are long-running goroutines that
+	// would duplicate consumption if started on multiple pods.
 	var instanceLoader *channels.InstanceLoader
-	if pgStores.ChannelInstances != nil {
+	if runtime.IsWorker() && pgStores.ChannelInstances != nil {
 		instanceLoader = channels.NewInstanceLoader(pgStores.ChannelInstances, pgStores.Agents, channelMgr, msgBus, pgStores.Pairing)
 		instanceLoader.SetProviderRegistry(providerRegistry)
 		instanceLoader.SetPendingCompactionConfig(cfg.Channels.PendingCompaction)
 		instanceLoader.SetUsageCapService(usageCapSvc)
 		instanceLoader.RegisterFactory(channels.TypeTelegram, telegram.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.Teams, pgStores.SubagentTasks, pgStores.PendingMessages, audioMgr))
 		instanceLoader.RegisterFactory(channels.TypeDiscord, discord.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.PendingMessages, audioMgr))
+		instanceLoader.RegisterFactory(channels.TypeDingtalk, dingtalk.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.PendingMessages, audioMgr))
 		instanceLoader.RegisterFactory(channels.TypeFeishu, feishu.FactoryWithStoresAndAudio(pgStores.Agents, pgStores.ConfigPermissions, pgStores.PendingMessages, audioMgr))
 		instanceLoader.RegisterFactory(channels.TypeZaloOA, zalo.Factory)
 		instanceLoader.RegisterFactory(channels.TypeZaloPersonal, zalopersonal.FactoryWithPendingStore(pgStores.PendingMessages))
@@ -911,7 +924,9 @@ func runGateway() {
 	}
 
 	// Register config-based channels as fallback when no DB instances loaded.
-	registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader, audioMgr)
+	if runtime.IsWorker() {
+		registerConfigChannels(cfg, channelMgr, msgBus, pgStores, instanceLoader, audioMgr)
+	}
 
 	// Register channels/instances/links/teams RPC methods
 	chInstancesM := wireChannelRPCMethods(server, pgStores, channelMgr, instanceLoader, agentRouter, msgBus, cfg, workspace)
@@ -965,13 +980,15 @@ func runGateway() {
 		}
 	}
 
-	// Start channels
-	if err := channelMgr.StartAll(ctx); err != nil {
-		slog.Error("failed to start channels", "error", err)
+	// Start channels (worker-only).
+	if runtime.IsWorker() {
+		if err := channelMgr.StartAll(ctx); err != nil {
+			slog.Error("failed to start channels", "error", err)
+		}
 	}
 
 	// Create lane-based scheduler (matching TS CommandLane pattern).
-	// Must be created before cron setup so cron jobs route through the scheduler.
+	// The scheduler is needed on api too — chat completions dispatch through it.
 	sched := scheduler.NewScheduler(
 		scheduler.DefaultLanes(),
 		scheduler.DefaultQueueConfig(),
@@ -980,7 +997,12 @@ func runGateway() {
 	defer sched.Stop()
 
 	// Start cron + heartbeat ticker, wire wake functions and adaptive throttle.
-	heartbeatTicker := startCronAndHeartbeat(pgStores, server, sched, msgBus, providerRegistry, channelMgr, cfg, heartbeatTool, heartbeatMethods)
+	// Worker-only: cron loop polls cron_jobs table; running on N pods would
+	// duplicate firings. Heartbeat ticker is also worker-only.
+	var heartbeatTicker *heartbeat.Ticker
+	if runtime.IsWorker() {
+		heartbeatTicker = startCronAndHeartbeat(pgStores, server, sched, msgBus, providerRegistry, channelMgr, cfg, heartbeatTool, heartbeatMethods)
+	}
 
 	// Subscribe to agent events for channel streaming/reaction forwarding.
 	deps.wireChannelStreamingSubscriber()

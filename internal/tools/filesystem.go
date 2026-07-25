@@ -183,6 +183,18 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 
 	data, err := os.ReadFile(resolved)
 	if err != nil {
+		if os.IsNotExist(err) {
+			// The model may be asking to read an uploaded document by the name it
+			// saw in the <media:document> tag. That tag carries no path (a path on
+			// arrival invites reading the file unprompted), so the literal name
+			// misses on disk. Resolve it here, on this explicit read, to the
+			// persisted upload — confined to the workspace, and never for binary.
+			if apath, ok := attachmentPathByName(ctx, path); ok && isWithin(apath, workspace) && !isBinaryFileExt(apath) {
+				if adata, aerr := os.ReadFile(apath); aerr == nil {
+					return t.paginateOutput(string(adata), args)
+				}
+			}
+		}
 		msg := fmt.Sprintf("failed to read file: %v", err)
 		if os.IsNotExist(err) {
 			if teamWs := ToolTeamWorkspaceFromCtx(ctx); teamWs != "" && !strings.HasPrefix(resolved, teamWs) {
@@ -193,6 +205,40 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	}
 
 	return t.paginateOutput(string(data), args)
+}
+
+// attachmentPathByName resolves a bare filename to the persisted path of an
+// uploaded document with that display name, if one is in context. It lets the
+// model read an attachment by the name shown in its <media:document> tag
+// without the tag ever exposing the path.
+func attachmentPathByName(ctx context.Context, name string) (string, bool) {
+	want := filepath.Base(name)
+	wantStem := strings.TrimSuffix(want, filepath.Ext(want))
+	for _, ref := range MediaDocRefsFromCtx(ctx) {
+		if ref.Path == "" || ref.Kind != "document" {
+			continue
+		}
+		base := filepath.Base(ref.Path)
+		clean := stripUploadShortID(base)
+		// Match on the full name or, tolerant of an extension the persisted file
+		// kept from its source, on the stem — the model asks by the display name
+		// it saw, which may differ in extension from what landed on disk.
+		if base == want || clean == want ||
+			strings.TrimSuffix(clean, filepath.Ext(clean)) == wantStem {
+			return ref.Path, true
+		}
+	}
+	return "", false
+}
+
+// isWithin reports whether path is inside root (after cleaning). Empty root
+// fails closed.
+func isWithin(path, root string) bool {
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (t *ReadFileTool) executeInSandbox(ctx context.Context, path, sandboxKey string, args map[string]any) *Result {

@@ -238,6 +238,28 @@ func mimeFromDocExt(ext string) string {
 		return "application/x-tar"
 	case ".gz", ".tgz":
 		return "application/gzip"
+	// Plain-text and source files: naming them text/* routes read_document to
+	// its direct-read fast path (no LLM spend) instead of the vision chain,
+	// which would otherwise receive them as octet-stream. Kept aligned with the
+	// media package's text-extension set so "text" means the same on the intake
+	// notice and here.
+	case ".txt", ".log", ".ini", ".cfg", ".env", ".sh", ".py", ".go", ".rs",
+		".java", ".c", ".cpp", ".h", ".rb", ".php", ".sql", ".css":
+		return "text/plain"
+	case ".md":
+		return "text/markdown"
+	case ".json":
+		return "application/json"
+	case ".yaml", ".yml":
+		return "text/yaml"
+	case ".xml":
+		return "text/xml"
+	case ".html":
+		return "text/html"
+	case ".js", ".ts":
+		return "application/javascript"
+	case ".tsv":
+		return "text/tab-separated-values"
 	default:
 		return "application/octet-stream"
 	}

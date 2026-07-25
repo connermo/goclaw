@@ -378,11 +378,11 @@ func (c *Channel) handleMessageEventFrom(ctx context.Context, event *MessageEven
 
 			case media.TypeDocument:
 				if m.FileName != "" && m.FilePath != "" {
-					docContent, err := media.ExtractDocumentContent(m.FilePath, m.FileName)
+					notice, err := media.DescribeDocument(m.FilePath, m.FileName)
 					if err != nil {
-						slog.Warn("feishu: document extraction failed", "file", m.FileName, "error", err)
-					} else if docContent != "" {
-						extraContent += "\n\n" + docContent
+						slog.Warn("feishu: document describe failed", "file", m.FileName, "error", err)
+					} else if notice != "" {
+						extraContent += "\n\n" + notice
 					}
 				}
 			}
